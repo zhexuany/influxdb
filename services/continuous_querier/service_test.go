@@ -37,6 +37,46 @@ func TestOpenAndClose(t *testing.T) {
 	}
 }
 
+// Test Run runContinuousQueries
+func TestContinuousQueryService_runContinuousQueries(t *testing.T) {
+	s := NewTestService(t)
+
+	// Set RunInterval high so we can trigger using Run method.
+	s.RunInterval = 10 * time.Minute
+
+	done := make(chan struct{})
+	expectCallCnt := 3
+	callCnt := 0
+
+	// Set a callback for ExecuteStatement.
+	s.QueryExecutor.StatementExecutor = &StatementExecutor{
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
+			callCnt++
+			if callCnt >= expectCallCnt {
+				done <- struct{}{}
+			}
+			ctx.Results <- &influxql.Result{}
+			return nil
+		},
+	}
+
+	// Use a custom "now" time since the internals of last run care about
+	// what the actual time is. Truncate to 10 minutes we are starting on an interval.
+	now := time.Now().Truncate(10 * time.Minute)
+
+	s.Open()
+	s.runContinuousQueries(&RunRequest{Now: now})
+	// Shouldn't time out.
+	if err := wait(done, 100*time.Millisecond); err != nil {
+		t.Error(err)
+	}
+	// This time it should timeout because ExecuteQuery should not get called again.
+	if err := wait(done, 100*time.Millisecond); err == nil {
+		t.Error("too many queries executed")
+	}
+	s.Close()
+}
+
 // Test Run method.
 func TestContinuousQueryService_Run(t *testing.T) {
 	s := NewTestService(t)

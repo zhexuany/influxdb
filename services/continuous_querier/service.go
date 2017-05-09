@@ -172,6 +172,7 @@ func (s *Service) Run(database, name string, t time.Time) error {
 	// Loop through databases.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var cqs []string
 	for _, db := range dbs {
 		// Loop through CQs in each DB executing the ones that match name.
 		for _, cq := range db.ContinuousQueries {
@@ -181,12 +182,16 @@ func (s *Service) Run(database, name string, t time.Time) error {
 				if _, ok := s.lastRuns[id]; ok {
 					delete(s.lastRuns, id)
 				}
+				cqs = append(cqs, cq.Name)
 			}
 		}
 	}
 
 	// Signal the background routine to run CQs.
-	s.RunCh <- &RunRequest{Now: t}
+	s.RunCh <- &RunRequest{
+		Now: t,
+		CQs: cqs,
+	}
 
 	return nil
 }
@@ -243,17 +248,25 @@ func (s *Service) runContinuousQueries(req *RunRequest) {
 	// Loop through all databases executing CQs.
 	for _, db := range dbs {
 		// TODO: distribute across nodes
-		for _, cq := range db.ContinuousQueries {
-			if !req.matches(&cq) {
-				continue
-			}
-			if err := s.ExecuteContinuousQuery(&db, &cq, req.Now); err != nil {
-				s.Logger.Info(fmt.Sprintf("error executing query: %s: err = %s", cq.Query, err))
-				atomic.AddInt64(&s.stats.QueryFail, 1)
-			} else {
-				atomic.AddInt64(&s.stats.QueryOK, 1)
-			}
+		db := db
+		go s.runContinuousQueriesWithDB(db, req)
+	}
+}
+
+func (s *Service) runContinuousQueriesWithDB(db meta.DatabaseInfo, req *RunRequest) {
+	for _, cq := range db.ContinuousQueries {
+		if len(req.CQs) == 0 || req.matches(&cq) {
+			go s.runContinuousQueriesWithDBAndCq(db, cq, req.Now)
 		}
+	}
+}
+
+func (s *Service) runContinuousQueriesWithDBAndCq(db meta.DatabaseInfo, cq meta.ContinuousQueryInfo, now time.Time) {
+	if err := s.ExecuteContinuousQuery(&db, &cq, now); err != nil {
+		s.Logger.Info(fmt.Sprintf("error executing query: %s: err = %s", cq.Query, err))
+		atomic.AddInt64(&s.stats.QueryFail, 1)
+	} else {
+		atomic.AddInt64(&s.stats.QueryOK, 1)
 	}
 }
 
@@ -268,9 +281,9 @@ func (s *Service) ExecuteContinuousQuery(dbi *meta.DatabaseInfo, cqi *meta.Conti
 		return err
 	}
 
-	// Get the last time this CQ was run from the service's cache.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Get the last time this CQ was run from the service's cache.
 	id := fmt.Sprintf("%s%s%s", dbi.Name, idDelimiter, cqi.Name)
 	cq.LastRun, cq.HasRun = s.lastRuns[id]
 
